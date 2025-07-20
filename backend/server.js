@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
+const db = require("./db");
 
 const app = express();
 const PORT = 3001;
@@ -8,33 +9,31 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json());
 
-let accounts = [];
-let transfers = [];
+// Helpers
+function findAccountById(accountId) {
+	return db.prepare("SELECT * FROM accounts WHERE id = ?").get(accountId);
+}
 
-const findAccountById = (accountId) => {
-	return accounts.find((account) => account.id === accountId);
-};
+function updateBalance(accountId, newBalance) {
+	db.prepare("UPDATE accounts SET balance = ? WHERE id = ?").run(
+		newBalance,
+		accountId
+	);
+}
 
-const hasValidBalance = (accountId, amount) => {
-	const account = findAccountById(accountId);
-	return account && account.balance >= amount;
-};
+// Routes
 
-// Create a new bank account
+// Create Account
 app.post("/api/accounts", (req, res) => {
 	const { customerName, initialDeposit } = req.body;
 
-	if (!customerName || !customerName.trim()) {
+	if (!customerName?.trim())
 		return res.status(400).json({ error: "Customer name is required" });
-	}
-
-	if (!initialDeposit || initialDeposit < 0) {
+	if (initialDeposit == null || initialDeposit < 0)
 		return res
 			.status(400)
-			.json({ error: "Initial deposit must be a positive number" });
-	}
+			.json({ error: "Initial deposit must be non-negative" });
 
-	// Create new account
 	const newAccount = {
 		id: uuidv4(),
 		customerName: customerName.trim(),
@@ -42,27 +41,26 @@ app.post("/api/accounts", (req, res) => {
 		createdAt: new Date().toISOString(),
 	};
 
-	accounts.push(newAccount);
+	db.prepare(
+		`
+		INSERT INTO accounts (id, customerName, balance, createdAt)
+		VALUES (@id, @customerName, @balance, @createdAt)
+	`
+	).run(newAccount);
 
-	res.status(201).json({
-		message: "Account created successfully",
-		account: newAccount,
-	});
+	res.status(201).json({ message: "Account created", account: newAccount });
 });
 
-// Get all accounts (for admin interface)
+// Get all accounts
 app.get("/api/accounts", (req, res) => {
+	const accounts = db.prepare("SELECT * FROM accounts").all();
 	res.json({ accounts });
 });
 
 // Get account balance
 app.get("/api/accounts/:accountId/balance", (req, res) => {
-	const { accountId } = req.params;
-	const account = findAccountById(accountId);
-
-	if (!account) {
-		return res.status(404).json({ error: "Account not found" });
-	}
+	const account = findAccountById(req.params.accountId);
+	if (!account) return res.status(404).json({ error: "Account not found" });
 
 	res.json({
 		accountId: account.id,
@@ -71,116 +69,109 @@ app.get("/api/accounts/:accountId/balance", (req, res) => {
 	});
 });
 
-// Transfer money between accounts
+// Deposit
+app.post("/api/accounts/:accountId/deposit", (req, res) => {
+	const { amount } = req.body;
+	const account = findAccountById(req.params.accountId);
+
+	if (!account) return res.status(404).json({ error: "Account not found" });
+	if (!amount || amount <= 0)
+		return res.status(400).json({ error: "Amount must be positive" });
+
+	const newBalance = account.balance + parseFloat(amount);
+	updateBalance(account.id, newBalance);
+
+	res.json({ message: "Deposit successful", newBalance });
+});
+
+// Withdraw
+app.post("/api/accounts/:accountId/withdraw", (req, res) => {
+	const { amount } = req.body;
+	const account = findAccountById(req.params.accountId);
+
+	if (!account) return res.status(404).json({ error: "Account not found" });
+	if (!amount || amount <= 0)
+		return res.status(400).json({ error: "Amount must be positive" });
+	if (account.balance < amount)
+		return res.status(400).json({ error: "Insufficient funds" });
+
+	const newBalance = account.balance - parseFloat(amount);
+	updateBalance(account.id, newBalance);
+
+	res.json({ message: "Withdrawal successful", newBalance });
+});
+
+// Transfer money
 app.post("/api/transfers", (req, res) => {
 	const { fromAccountId, toAccountId, amount, description } = req.body;
 
-	// Validation
-	if (!fromAccountId || !toAccountId) {
+	if (!fromAccountId || !toAccountId || fromAccountId === toAccountId)
+		return res.status(400).json({ error: "Invalid from/to account IDs" });
+	if (!amount || amount <= 0)
+		return res.status(400).json({ error: "Invalid amount" });
+
+	const from = findAccountById(fromAccountId);
+	const to = findAccountById(toAccountId);
+	if (!from || !to)
 		return res
-			.status(400)
-			.json({ error: "Both from and to account IDs are required" });
-	}
+			.status(404)
+			.json({ error: "One or both accounts not found" });
+	if (from.balance < amount)
+		return res.status(400).json({ error: "Insufficient funds" });
 
-	if (!amount || amount <= 0) {
-		return res
-			.status(400)
-			.json({ error: "Amount must be a positive number" });
-	}
+	const newFromBalance = from.balance - amount;
+	const newToBalance = to.balance + amount;
 
-	if (fromAccountId === toAccountId) {
-		return res
-			.status(400)
-			.json({ error: "Cannot transfer to the same account" });
-	}
-
-	// Check if accounts exist
-	const fromAccount = findAccountById(fromAccountId);
-	const toAccount = findAccountById(toAccountId);
-
-	if (!fromAccount) {
-		return res.status(404).json({ error: "From account not found" });
-	}
-
-	if (!toAccount) {
-		return res.status(404).json({ error: "To account not found" });
-	}
-
-	// Check if from account has sufficient balance
-	if (!hasValidBalance(fromAccountId, amount)) {
-		return res.status(400).json({ error: "Insufficient balance" });
-	}
-
-	// Perform transfer
-	const transferAmount = parseFloat(amount);
-	fromAccount.balance -= transferAmount;
-	toAccount.balance += transferAmount;
-
-	// Record transfer
 	const transfer = {
 		id: uuidv4(),
 		fromAccountId,
 		toAccountId,
-		fromCustomerName: fromAccount.customerName,
-		toCustomerName: toAccount.customerName,
-		amount: transferAmount,
+		amount,
 		description: description || "Transfer",
 		timestamp: new Date().toISOString(),
 	};
 
-	transfers.push(transfer);
+	const insert = db.prepare(`
+		INSERT INTO transfers (id, fromAccountId, toAccountId, amount, description, timestamp)
+		VALUES (@id, @fromAccountId, @toAccountId, @amount, @description, @timestamp)
+	`);
 
-	res.json({
-		message: "Transfer completed successfully",
-		transfer,
-		fromAccountBalance: fromAccount.balance,
-		toAccountBalance: toAccount.balance,
+	const transaction = db.transaction(() => {
+		updateBalance(from.id, newFromBalance);
+		updateBalance(to.id, newToBalance);
+		insert.run(transfer);
 	});
+
+	transaction();
+
+	res.json({ message: "Transfer successful", transfer });
 });
 
-// Get transfer history for an account
+// Get transfer history
 app.get("/api/accounts/:accountId/transfers", (req, res) => {
-	const { accountId } = req.params;
-
-	// Check if account exists
+	const accountId = req.params.accountId;
 	const account = findAccountById(accountId);
-	if (!account) {
-		return res.status(404).json({ error: "Account not found" });
-	}
+	if (!account) return res.status(404).json({ error: "Account not found" });
 
-	// Get transfers for this account
-	const accountTransfers = transfers.filter(
-		(transfer) =>
-			transfer.fromAccountId === accountId ||
-			transfer.toAccountId === accountId
-	);
-
-	// Format transfers to show direction
-	const formattedTransfers = accountTransfers.map((transfer) => ({
-		...transfer,
-		type: transfer.fromAccountId === accountId ? "outgoing" : "incoming",
+	const stmt = db.prepare(`
+		SELECT * FROM transfers
+		WHERE fromAccountId = ? OR toAccountId = ?
+		ORDER BY timestamp DESC
+	`);
+	const transfers = stmt.all(accountId, accountId).map((t) => ({
+		...t,
+		type: t.fromAccountId === accountId ? "outgoing" : "incoming",
 	}));
 
-	res.json({
-		accountId,
-		customerName: account.customerName,
-		transfers: formattedTransfers,
-	});
+	res.json({ accountId, customerName: account.customerName, transfers });
 });
 
+// Error handler
 app.use((err, req, res, next) => {
 	console.error(err.stack);
-	res.status(500).json({ error: "Something went wrong!" });
+	res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(PORT, () => {
-	console.log(`Banking API server running on http://localhost:${PORT}`);
-	console.log("Available endpoints:");
-	console.log("POST /api/accounts - Create new account");
-	console.log("GET /api/accounts - Get all accounts");
-	console.log("GET /api/accounts/:id/balance - Get account balance");
-	console.log("POST /api/transfers - Transfer money");
-	console.log("GET /api/accounts/:id/transfers - Get transfer history");
+	console.log("Banking API server running");
 });
-
-module.exports = app;
