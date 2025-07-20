@@ -1,4 +1,4 @@
-# **Meow Interview Banking API Project**
+# **Full Stack Banking API Project**
 
 **Backend:** ExpressJS with SQLite database  
 **Frontend:** ReactJS  
